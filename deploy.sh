@@ -22,7 +22,10 @@
 #
 # 环境变量：
 #   USE_MIRROR=1                # 等价于 --mirror，优先使用国内镜像源
-#   IMAGE_MIRROR=<repo:tag>     # 自定义 ghcr 代理镜像地址（默认南京大学镜像源）
+#   IMAGE_MIRROR=<host/repo:tag># 自定义 ghcr 代理完整地址（会优先于内置候选池尝试）
+#
+# 内置国内镜像源候选池（--mirror 时按序自动尝试）：
+#   ghcr.m.daocloud.io / ghcr.nju.edu.cn / ghcr.geekery.cn
 # ==============================================================================
 
 set -euo pipefail
@@ -45,9 +48,15 @@ cd "$SCRIPT_DIR"
 
 COMPOSE_FILE="docker-compose.yaml"
 DEV_COMPOSE_FILE="docker-compose.dev.yaml"
-IMAGE_GHCR="ghcr.io/usagi-org/ai-goofish:latest"
-# 国内加速镜像源（可通过环境变量 IMAGE_MIRROR 覆盖为其它 ghcr 代理）
-IMAGE_MIRROR="${IMAGE_MIRROR:-ghcr.nju.edu.cn/usagi-org/ai-goofish:latest}"
+IMAGE_REPO="usagi-org/ai-goofish:latest"
+IMAGE_GHCR="ghcr.io/${IMAGE_REPO}"
+# 国内 ghcr 加速镜像源候选池，脚本会按顺序逐个尝试直到成功。
+# DaoCloud 通常最快，放首位；可用 IMAGE_MIRROR 环境变量指定自定义源（会优先尝试）。
+IMAGE_MIRROR_HOSTS=(
+    "ghcr.m.daocloud.io"
+    "ghcr.nju.edu.cn"
+    "ghcr.geekery.cn"
+)
 # 是否优先使用国内镜像源（国内服务器建议开启）。可用 --mirror 或 USE_MIRROR=1 开启。
 PREFER_MIRROR="${USE_MIRROR:-0}"
 DATA_DIRS=(data state logs images jsonl price_history)
@@ -125,13 +134,27 @@ prepare_dirs() {
     info "已确保目录存在：${DATA_DIRS[*]}"
 }
 
-# 从镜像源拉取并重新打成 ghcr.io 标签（compose 默认引用 ghcr.io 名称）
+# 逐个尝试镜像源候选池，拉到即重新打成 ghcr.io 标签（compose 默认引用 ghcr.io 名称）
 pull_from_mirror() {
-    if docker pull "$IMAGE_MIRROR"; then
-        docker tag "$IMAGE_MIRROR" "$IMAGE_GHCR"
-        info "已从镜像源 ${IMAGE_MIRROR} 拉取并重新打标签为 ${IMAGE_GHCR}"
-        return 0
+    # 用户通过 IMAGE_MIRROR 指定的完整地址优先尝试
+    if [ -n "${IMAGE_MIRROR:-}" ]; then
+        if docker pull "$IMAGE_MIRROR"; then
+            docker tag "$IMAGE_MIRROR" "$IMAGE_GHCR"
+            info "已从自定义镜像源 ${IMAGE_MIRROR} 拉取"
+            return 0
+        fi
+        warn "自定义镜像源 ${IMAGE_MIRROR} 拉取失败，尝试内置候选池…"
     fi
+    for host in "${IMAGE_MIRROR_HOSTS[@]}"; do
+        local ref="${host}/${IMAGE_REPO}"
+        echo -e "${BLUE}==>${NC} 尝试镜像源：${ref}"
+        if docker pull "$ref"; then
+            docker tag "$ref" "$IMAGE_GHCR"
+            info "已从镜像源 ${ref} 拉取并重新打标签为 ${IMAGE_GHCR}"
+            return 0
+        fi
+        warn "${host} 拉取失败/过慢，换下一个…"
+    done
     return 1
 }
 
@@ -147,13 +170,13 @@ pull_from_ghcr() {
 pull_image() {
     step "拉取镜像"
     if [ "$PREFER_MIRROR" = "1" ]; then
-        info "优先使用国内镜像源：${IMAGE_MIRROR}"
+        info "优先使用国内镜像源候选池：${IMAGE_MIRROR_HOSTS[*]}"
         if pull_from_mirror; then return 0; fi
-        warn "镜像源拉取失败，回退 ghcr.io…"
+        warn "所有国内镜像源均失败，回退 ghcr.io…"
         if pull_from_ghcr; then return 0; fi
     else
         if pull_from_ghcr; then return 0; fi
-        warn "ghcr.io 拉取失败/过慢，尝试国内镜像源 ${IMAGE_MIRROR}…"
+        warn "ghcr.io 拉取失败/过慢，尝试国内镜像源候选池…"
         if pull_from_mirror; then return 0; fi
     fi
     error "镜像拉取失败。可尝试：1) 加 --mirror 优先国内源；2) 设置 IMAGE_MIRROR 指定其它 ghcr 代理；3) 'bash deploy.sh --build' 从源码本地构建。"
