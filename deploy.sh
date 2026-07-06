@@ -14,10 +14,15 @@
 #
 # 用法：
 #   bash deploy.sh              # 拉取预构建镜像并部署（推荐）
+#   bash deploy.sh --mirror     # 国内服务器：优先用国内镜像源拉取（更快）
 #   bash deploy.sh --build      # 使用源码本地构建镜像（docker-compose.dev.yaml）
-#   bash deploy.sh --update     # 更新到最新镜像并重启
+#   bash deploy.sh --update     # 更新到最新镜像并重启（可加 --mirror）
 #   bash deploy.sh --logs       # 查看实时日志
 #   bash deploy.sh --down       # 停止并移除容器
+#
+# 环境变量：
+#   USE_MIRROR=1                # 等价于 --mirror，优先使用国内镜像源
+#   IMAGE_MIRROR=<repo:tag>     # 自定义 ghcr 代理镜像地址（默认南京大学镜像源）
 # ==============================================================================
 
 set -euo pipefail
@@ -41,7 +46,10 @@ cd "$SCRIPT_DIR"
 COMPOSE_FILE="docker-compose.yaml"
 DEV_COMPOSE_FILE="docker-compose.dev.yaml"
 IMAGE_GHCR="ghcr.io/usagi-org/ai-goofish:latest"
-IMAGE_MIRROR="ghcr.nju.edu.cn/usagi-org/ai-goofish:latest"
+# 国内加速镜像源（可通过环境变量 IMAGE_MIRROR 覆盖为其它 ghcr 代理）
+IMAGE_MIRROR="${IMAGE_MIRROR:-ghcr.nju.edu.cn/usagi-org/ai-goofish:latest}"
+# 是否优先使用国内镜像源（国内服务器建议开启）。可用 --mirror 或 USE_MIRROR=1 开启。
+PREFER_MIRROR="${USE_MIRROR:-0}"
 DATA_DIRS=(data state logs images jsonl price_history)
 
 # ---------- 检测 docker compose 命令 ----------
@@ -117,21 +125,39 @@ prepare_dirs() {
     info "已确保目录存在：${DATA_DIRS[*]}"
 }
 
-# ---------- 拉取镜像（带镜像回退）----------
-pull_image() {
-    step "拉取镜像"
+# 从镜像源拉取并重新打成 ghcr.io 标签（compose 默认引用 ghcr.io 名称）
+pull_from_mirror() {
+    if docker pull "$IMAGE_MIRROR"; then
+        docker tag "$IMAGE_MIRROR" "$IMAGE_GHCR"
+        info "已从镜像源 ${IMAGE_MIRROR} 拉取并重新打标签为 ${IMAGE_GHCR}"
+        return 0
+    fi
+    return 1
+}
+
+pull_from_ghcr() {
     if docker pull "$IMAGE_GHCR"; then
         info "已从 ghcr.io 拉取镜像"
-    else
-        warn "ghcr.io 拉取失败，尝试南京大学镜像源…"
-        if docker pull "$IMAGE_MIRROR"; then
-            docker tag "$IMAGE_MIRROR" "$IMAGE_GHCR"
-            info "已从镜像源拉取并重新打标签为 ${IMAGE_GHCR}"
-        else
-            error "镜像拉取失败。请检查网络，或使用 'bash deploy.sh --build' 从源码本地构建。"
-            exit 1
-        fi
+        return 0
     fi
+    return 1
+}
+
+# ---------- 拉取镜像（带镜像源回退，国内可优先镜像源）----------
+pull_image() {
+    step "拉取镜像"
+    if [ "$PREFER_MIRROR" = "1" ]; then
+        info "优先使用国内镜像源：${IMAGE_MIRROR}"
+        if pull_from_mirror; then return 0; fi
+        warn "镜像源拉取失败，回退 ghcr.io…"
+        if pull_from_ghcr; then return 0; fi
+    else
+        if pull_from_ghcr; then return 0; fi
+        warn "ghcr.io 拉取失败/过慢，尝试国内镜像源 ${IMAGE_MIRROR}…"
+        if pull_from_mirror; then return 0; fi
+    fi
+    error "镜像拉取失败。可尝试：1) 加 --mirror 优先国内源；2) 设置 IMAGE_MIRROR 指定其它 ghcr 代理；3) 'bash deploy.sh --build' 从源码本地构建。"
+    exit 1
 }
 
 # ---------- 启动服务 ----------
@@ -232,7 +258,15 @@ cmd_down() {
 
 # ---------- 入口 ----------
 main() {
-    local action="${1:-deploy}"
+    local action=""
+    # 先扫描修饰符 --mirror（可与任意动作组合），其余作为动作
+    for arg in "$@"; do
+        case "$arg" in
+            --mirror) PREFER_MIRROR=1 ;;
+            *) [ -z "$action" ] && action="$arg" ;;
+        esac
+    done
+
     case "$action" in
         ""|deploy)  cmd_deploy ;;
         --build)    cmd_build ;;
@@ -244,7 +278,7 @@ main() {
             ;;
         *)
             error "未知参数：$action"
-            echo "用法：bash deploy.sh [--build|--update|--logs|--down|--help]"
+            echo "用法：bash deploy.sh [--build|--update|--logs|--down|--mirror|--help]"
             exit 1
             ;;
     esac
