@@ -147,7 +147,7 @@ start_service_build() {
 
 # ---------- 健康检查 ----------
 get_port() {
-    local port=8000
+    local port=5352
     if [ -f ".env" ]; then
         local p
         p="$(grep -E '^SERVER_PORT=' .env | tail -n1 | cut -d= -f2 | tr -d '[:space:]' || true)"
